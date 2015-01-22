@@ -4,7 +4,38 @@ CON
   ******* Public Notes *******
 
   This program is used to monitor four quadrature
-  encoders like those used by the Rover 5 chassis.
+  encoders while producing PWM outputs.
+
+  Use the constant "TOTAL_ENCODERS" to set the desired
+  number of encoders to read and the number of motors
+  to control.
+
+  The motor control driver may be used with a variety
+  of h-bridges.
+  
+  If the h-bridge uses a single direction pin set the
+  other direction pin to -1.
+
+  If both direction pins are set to -1, then the object
+  will assume the motor is controlled as a continuous
+  rotation servo. The motors may be a mix of "normal"
+  h-bridge motors and continuous rotation type motors
+  but if one continuous rotation type motor is used,
+  the PWM frequency will be set to "SERVO_FREQUENCY"
+  (generally 50Hz).
+
+  There is a trade off between the resolution one may
+  have over the PWM signal and the frequency of the
+  signal. High PWM frequencies will allow lower resolution
+  control of the PWM signal.
+  
+  There's a lot of code in this object which is not used
+  by the demo object. I plan to remove a lot of the
+  code in the PASM loop which should allow greater
+  precision at higher PWM frequencies.
+
+  I will likely remove at least one of the buffers.
+  
   See comments at start of each method.
 
   This object was written by Duane Degn
@@ -82,11 +113,9 @@ CON
   TOTAL_ENCODERS = 2            '' User changeable
                                 '' It is possible to change to any number (within reason)
                                 '' of motor with encoders
-                            
                                                                
   MAX_ENCODER_INDEX = TOTAL_ENCODERS - 1                              
-  'SPEED_BUFFER_SIZE = 16
-  
+
   DEFAULT_PWM_FREQUENCY = 200         '' user changeable
   DEFALUT_PWM_RESOLUTION = 1_000     '' user changeable
 
@@ -95,38 +124,45 @@ CON
 
   DEFAULT_BITS_TO_AVERAGE = 5   '' user changeable
  
-  MAX_BUFFER_SIZE = 1 << MAX_BITS_TO_AVERAGE '|< (MAX_BITS_TO_AVERAGE - 1)
+  MAX_BUFFER_SIZE = 1 << MAX_BITS_TO_AVERAGE 
  
-  'MAX_BUFFER_INDEX = MAX_BITS_TO_AVERAGE - 1
-
   SERVO_FREQUENCY = 50
   SERVO_STOP = 1500
   SERVO_FULL_SPEED = 500          '' user changeable
 
   BYTES_PER_MINI_BUFF = 16
-    
+
+  FORWARD_POSITIVE = 1
+  FORWARD_NEGATIVE = 0
+     
 VAR
 
-  'long speedBuffer[SPEED_BUFFER_SIZE * TOTAL_ENCODERS]
   long cog
   long debugTime
   long pulseBuffer[MAX_BUFFER_SIZE * TOTAL_ENCODERS]
   long pwmOnTime[TOTAL_ENCODERS], pwmTime
   long pwmFrequency, pwmResolution
-  long targetPtr, negativePinPtr, positivePinPtr
+  long targetPowerPtr, negativePinPtr, positivePinPtr
   long largestMotorsInUseIndex
   long servoStopTics, servoFullSpeedTics
   long negPwmResolution, encoderPtr, encoderPinPtr
   long speedPtr, enablePinPtr
-  long bufferSize', bufferBitsToShift', maxBufferIndex
+  long bufferSize
   long dataPairAddress
   long dataPairBufferA[4 * TOTAL_ENCODERS]
   long dataPairBufferB[4 * TOTAL_ENCODERS]
   
-  byte servoFlag
+  byte servoFlag[TOTAL_ENCODERS], servoCount
+  byte validPositivePin[TOTAL_ENCODERS]
+  byte validNegativePin[TOTAL_ENCODERS]
             
+DAT
+
+forwardPositivePin      byte FORWARD_POSITIVE [TOTAL_ENCODERS]
+forwardNegativePin      byte FORWARD_NEGATIVE [TOTAL_ENCODERS]
+
 PUB StartEncoders(encoderPinPtr_, encoderPtr_, speedPtr_, enablePinPtr_, positivePinPtr_, {
-  } negativePinPtr_, targetPtr_, directionFlagPtr_) | localIndex
+  } negativePinPtr_, targetPowerPtr_, directionFlagPtr_) | localIndex
 '' This method expects encoder pins to be stored sequentially
 '' in an array of bytes at encoderPinPtr.
 '' The value "encoderPtr" should be the memory location
@@ -135,10 +171,16 @@ PUB StartEncoders(encoderPinPtr_, encoderPtr_, speedPtr_, enablePinPtr_, positiv
 '' The value "speedPtr" should be the memory location
 '' of four sequential longs where the sum of "speedBuffer" values
 '' will be written.
-'' This method needs to be called to start using object.
-'' There isn't a "Stop" method so multiple calls
-'' will launch multiple cogs which will likely cause serious
-'' problems for parent program.
+'' "targetPowerPtr_" should be the memory location where values used
+'' by the method "RefreshPower".
+'' This "StartEncoders" method needs to be called to start using object.
+'' The directionFlagPtr_ is the memory location where the driver
+'' will write which direction the motor is rotating (1 or -1).
+'' I think I included this pointer to allow the parent object
+'' to quickly identfy which direction the motors are turning
+'' I believe I added this feature to speed up the Spin calculations
+'' in the parent object. I may remove this feature in order to
+'' speed up the PASM loop.
 
   servoStopTics := (clkfreq / 1_000_000) * SERVO_STOP
   servoFullSpeedTics := (clkfreq / 1_000_000) * SERVO_FULL_SPEED
@@ -146,11 +188,9 @@ PUB StartEncoders(encoderPinPtr_, encoderPtr_, speedPtr_, enablePinPtr_, positiv
   encoderPtr := encoderPtr_
   speedPtr := speedPtr_
   enablePinPtr := enablePinPtr_
-  'negativePinPtr := negativePinPtr_
-  'positivePinPtr := positivePinPtr_
-  negativePinPtr := positivePinPtr_
+  negativePinPtr := positivePinPtr_  ' these were swapped to match Eddie firmware
   positivePinPtr := negativePinPtr_
-  targetPtr := targetPtr_
+  targetPowerPtr := targetPowerPtr_
   dataPairAddress := @dataPairBufferA
   
   dataPairAddressPtr := @dataPairAddress
@@ -164,60 +204,32 @@ PUB StartEncoders(encoderPinPtr_, encoderPtr_, speedPtr_, enablePinPtr_, positiv
     onTimePtr0[localIndex] := @pwmOnTime + (4 * localIndex)
  
   timeAddress := @debugTime
-  'buffer0 := @speedBuffer       ' first location in each buffer (static)
-  'buffer1 := buffer0 + (SPEED_BUFFER_SIZE * 4)
-  'buffer2 := buffer1 + (SPEED_BUFFER_SIZE * 4)
-  'buffer3 := buffer2 + (SPEED_BUFFER_SIZE * 4)
-
   
   SetBufferSize(DEFAULT_BITS_TO_AVERAGE)
-  
-  
-  
- { buffer0Head := buffer0        ' current location in each buffer (dynamic)
-  buffer1Head := buffer1
-  buffer2Head := buffer2
-  buffer3Head := buffer3    
- 
-  pulseHead0 := 0'pulse0
-  pulseHead1 := 0'pulse1
-  pulseHead2 := 0'pulse2
-  pulseHead3 := 0'pulse3    }
-   
 
- { pulseBufferSumPtr0 := speedPtr 
-  pulseBufferSumPtr1 := pulseBufferSumPtr0 + 4
-  pulseBufferSumPtr2 := pulseBufferSumPtr1 + 4  '' >>4to2<< comment out line
-  pulseBufferSumPtr3 := pulseBufferSumPtr2 + 4  '' >>4to2<< comment out line
-  lastUpdatedPtr0 := pulseBufferSumPtr3 + 4   '' >>4to2<< comment out line
-  'lastUpdatedPtr0 := pulseBufferSumPtr1 + 4 '' >>4to2<< uncomment line
-  lastUpdatedPtr1 := lastUpdatedPtr0 + 4      
-  lastUpdatedPtr2 := lastUpdatedPtr1 + 4       '' >>4to2<< comment out line
-  lastUpdatedPtr3 := lastUpdatedPtr2 + 4       '' >>4to2<< comment out line
-    }
   repeat localIndex from 0 to MAX_ENCODER_INDEX 
     result := long[enablePinPtr][localIndex]
     if result == -1
       next
     largestMotorsInUseIndex := localIndex  
     enableMask0[localIndex] := 1 << result
-    result := long[positivePinPtr][localIndex]
-    if result == -1
-      servoFlag := 1
-      next
-    dira[result] := 1
-    if result <> -1
-      dira[long[negativePinPtr][localIndex]] := 1
-
+    if long[positivePinPtr][localIndex] == -1 and long[negativePinPtr][localIndex] == -1
+      servoFlag[localIndex] := 1
+      servoCount++
+    elseif long[positivePinPtr][localIndex] == -1
+      validNegativePin[localIndex] := 1
+    elseif long[negativePinPtr][localIndex] == -1
+      validPositivePin[localIndex] := 1
+    else ' both direction pins valid 
+      validPositivePin[localIndex] := 1
+      validNegativePin[localIndex] := 1
+      
+    dira[long[positivePinPtr][localIndex]] := validPositivePin[localIndex]
+    dira[long[negativePinPtr][localIndex]] := validNegativePin[localIndex]
     
   SetFrequency(DEFAULT_PWM_FREQUENCY)
   SetResolution(DEFALUT_PWM_RESOLUTION)
-  
-  {onTimePtr0 := @pwmOnTime
-  onTimePtr1 := onTimePtr0 + 4
-  onTimePtr2 := onTimePtr1 + 4   '' >>4to2<< comment out line
-  onTimePtr3 := onTimePtr2 + 4   '' >>4to2<< comment out line
-  }
+
   pwmTimePtr := @pwmTime
   pwmTimeCog := pwmTime
 
@@ -225,9 +237,37 @@ PUB StartEncoders(encoderPinPtr_, encoderPtr_, speedPtr_, enablePinPtr_, positiv
   
   result := cog := cognew(@enter, encoderPtr) + 1
 
-PUB Stop
-'' frees a cog
+PUB ReverseMotor(channel)
+'' This method may be called before or after the
+'' call to the Start method.
+'' This method allows the direction of a motor to
+'' be reversed without the need to switch the
+'' physical wires of the motors.
 
+  if channel > MAX_ENCODER_INDEX
+    return 0
+    
+  forwardPositivePin[channel] := FORWARD_NEGATIVE
+  forwardNegativePin[channel] := FORWARD_POSITIVE
+
+PUB ReleasePins : localIndex
+
+  repeat localIndex from 0 to MAX_ENCODER_INDEX 
+    if validPositivePin[localIndex]
+      outa[long[positivePinPtr][localIndex]] := 0
+      dira[long[positivePinPtr][localIndex]] := 0
+      validPositivePin[localIndex] := 0
+    if validNegativePin[localIndex]
+      outa[long[negativePinPtr][localIndex]] := 0
+      dira[long[negativePinPtr][localIndex]] := 0
+      validNegativePin[localIndex] := 0
+      
+PUB Stop
+'' Stops the cog reading the encoders and generating
+'' the PWM signals.
+
+  ReleasePins
+  
   if cog
     cogstop(cog~ - 1)
   
@@ -243,15 +283,27 @@ PUB GetPointer(channel)
     dataPairAddress := @dataPairBufferA
     
 PUB GetPairPtr
+'' Used for debugging.
+'' The buffers used to hold the encoder
+'' data with timestamps are located
+'' at the address returned by this
+'' method.
 
   result := @dataPairBufferA
   
 PUB SetBitsToAverage(localBits)
+'' This method adjusts the size of the buffer
+'' used to calculate the average speed.
+'' When changing buffer size, it is neccessary
+'' to restart the cog running the encoder/PWM
+'' driver.
 
+  SetBufferSize(localBits)
+  
   if cog
-    Stop
+    cogstop(cog~ - 1)
     result := StartEncoders(encoderPinPtr, encoderPtr, speedPtr, enablePinPtr, positivePinPtr, {
-    } negativePinPtr, targetPtr, directionFlagPtr0)
+    } negativePinPtr, targetPowerPtr, directionFlagPtr0)
      
 PRI SetBufferSize(localBits) | localIndex
 
@@ -264,49 +316,62 @@ PRI SetBufferSize(localBits) | localIndex
     pulsePtr0[localIndex] := @pulseBuffer + (localIndex * headRollover)
    
 PUB SetFrequency(localFrequency)
+'' Sets the frequency used by the PWM algorithm.
+'' Returns the PWM period in clock cycles.
 
-  if servoFlag
+  if servoCount
     pwmFrequency := SERVO_FREQUENCY
   else
     pwmFrequency := localFrequency
-  pwmTime := clkfreq / pwmFrequency
+  result := pwmTime := clkfreq / pwmFrequency
   
 PUB SetResolution(localResolution)
+'' This method can be used to change which value
+'' will be considered full speed. The actual
+'' resolution used by the driver will depend
+'' of the PWM frequency and the time it takes
+'' the PASM code to complete a control loop.
 
   pwmResolution := localResolution
   negPwmResolution := -1 * pwmResolution
   
-PUB RefreshSpeed | localSpeed, localIndex
+PUB RefreshPower | localPower, localIndex
+'' Fills the "pwmOnTime" array with values
+'' based on the current target power.
 
   result := @pwmOnTime
 
-  if servoFlag
-    repeat localIndex from 0 to largestMotorsInUseIndex
-      localSpeed := long[targetPtr][localIndex]
-      localSpeed <#= pwmResolution
-      localSpeed #>= negPwmResolution
-      pwmOnTime[localIndex] := servoStopTics + ((servoFullSpeedTics * localSpeed) / pwmResolution) 
-  else
-    repeat localIndex from 0 to largestMotorsInUseIndex
-      localSpeed := long[targetPtr][localIndex]
-      if localSpeed == 0
-        outa[long[positivePinPtr][localIndex]] := 0
-        if outa[long[negativePinPtr][localIndex]] <> -1
+  repeat localIndex from 0 to largestMotorsInUseIndex
+    if servoFlag[localIndex]
+      SetServoPwm(localIndex)
+    else  
+      localPower := long[targetPowerPtr][localIndex]
+      if localPower == 0
+        if validPositivePin[localIndex]
+          outa[long[positivePinPtr][localIndex]] := 0
+        if validNegativePin[localIndex]
           outa[long[negativePinPtr][localIndex]] := 0
         pwmOnTime[localIndex] := 0
         next  
-      elseif localSpeed > 0
-        if outa[long[negativePinPtr][localIndex]] <> -1
-          outa[long[negativePinPtr][localIndex]] := 0
-        outa[long[positivePinPtr][localIndex]] := 1
-      else
-        -localSpeed
-        outa[long[positivePinPtr][localIndex]] := 0
-        if outa[long[negativePinPtr][localIndex]] <> -1
-          outa[long[negativePinPtr][localIndex]] := 1  
-      localSpeed <#= pwmResolution
-      pwmOnTime[localIndex] := (pwmTime * localSpeed) / pwmResolution
+      elseif localPower > 0
+        if validNegativePin[localIndex]
+          outa[long[negativePinPtr][localIndex]] := forwardNegativePin[localIndex]
+        if validPositivePin[localIndex]
+          outa[long[positivePinPtr][localIndex]] := forwardPositivePin[localIndex]
+      else ' reverse
+        -localPower
+        if validPositivePin[localIndex]
+          outa[long[positivePinPtr][localIndex]] := forwardNegativePin[localIndex]
+        if validNegativePin[localIndex]
+          outa[long[negativePinPtr][localIndex]] := forwardPositivePin[localIndex]  
+      localPower <#= pwmResolution
+      pwmOnTime[localIndex] := (pwmTime * localPower) / pwmResolution
  
+PRI SetServoPwm(localIndex)
+
+  result := negPwmResolution #> long[targetPowerPtr][localIndex] <#= pwmResolution
+  pwmOnTime[localIndex] := servoStopTics + ((servoFullSpeedTics * result) / pwmResolution) 
+  
 PUB GetBufferSize
 
   result := bufferSize
@@ -374,7 +439,7 @@ orEnableMask            or      dira, enableMask0
 
 '-------------------------------------------------------------------------------
 
-encloop                 mov     nowTime, cnt    ' use the same time point for all comparisons
+mainLoop                 mov     nowTime, cnt    ' use the same time point for all comparisons
                                          ' if source is larger, write c
 
                         mov     pwmTimeTemp, nowTime 
@@ -390,7 +455,8 @@ turnOff       if_c      andn    outa, 0-0          ' turned off.
                         djnz    channelCountdown, #compareOnTimes
                         cmps    pwmTimeCog, pwmTimeTemp wc 
               if_c      jmp    #checkPwm        ' PWM period is over
-                        
+                                                ' PWM values are read once per
+                                                ' period
               
 continueLoop            mov     previousTime, loopTimer   ' first reading will be garbage
                         mov     loopTimer, cnt            ' find time to execute loop
@@ -399,8 +465,10 @@ continueLoop            mov     previousTime, loopTimer   ' first reading will b
                                    
                         wrlong  deltaTime, timeAddress             
 
-                        mov     originalScan, ina               ' get current inputs
-
+                        mov     originalScan, ina       ' get current inputs
+                                                        ' this input state is used
+                                                        ' to read all the encoders
+                                                        
                         movs    shiftNewScanRight, #encoderPin0
                         movs    setOldScanValue, #oldscan0
                         movd    movToOldScan, #oldscan0
@@ -411,8 +479,8 @@ continueLoop            mov     previousTime, loopTimer   ' first reading will b
                         movd    newPulseBecomesLast, #lastPulse0
                         movs    writePulseBufferSum, #pulseBufferSumPtr0
                         movs    addPulseHead, #pulseHead0
-                        {movd    addPulseHead, #pulsePtr0
-                        movs    readFromPulsePtr, #pulsePtr0
+                        {movd    addPulseHead, #pulsePtr0    '' pulsePtrX needs to be treated
+                        movs    readFromPulsePtr, #pulsePtr0 '' differently from other variables
                         movs    writeToPlusPtr, #pulsePtr0 }
                         movd    addFourToPulseHead, #pulseHead0
                         movd    checkForRollover, #pulseHead0  
@@ -441,35 +509,15 @@ continueLoop            mov     previousTime, loopTimer   ' first reading will b
 originalScanValues      mov     newscan, originalScan           
 shiftNewScanRight       shr     newscan, 0-0 'encoderPin0
 setOldScanValue         mov     oldScan, 0-0 'oldscan0
-           
-                       { mov     newscan, originalScan           
-                        shr     newscan, encoderPin0
-                        mov     oldScan, oldscan0  }             
-                        'mov     encoderTotal, encoderTotal0     
-                        'mov     encoderAddress, encoderAddress0
-                                
-                        'mov     lastPulse, lastPulse0
-                        'mov     pulseBufferSumPtr, pulseBufferSumPtr0  ' no change
-                        'mov     pulseHead, pulseHead0   ' will change
-                        'mov     lastUpdatedPtr, lastUpdatedPtr0    ' no change
-                        'mov     pulseTotal, pulseTotal0   ' will change
-setPulsePtr             mov     pulsePtr, 0-0 'pulsePtr0       ' no change
-'                        mov     pulsePtr, pulsePtr0       ' no change
-                        'mov     directionFlagPtr, directionFlagPtr0
 
-                        call    #chkEncoder                     ' run algorithm with active variables
+setPulsePtr             mov     pulsePtr, 0-0 'pulsePtr0     
+'                     
+                        call    #checkEncoder   ' run algorithm with active variables
 
 movToOldScan            mov     0-0, newscan 'oldscan0, newscan                        
-                        'mov     oldscan0, newscan 
-                        'mov     encoderTotal0, encoderTotal
+                      
 addChangeToQuanta       add     0-0, encoderChange 'encoderQuanta0, encoderChange
-'                        add     encoderQuanta0, encoderChange
-
-                        '**
-                        'mov     pulseTotal0, pulseTotal
-                        'mov     pulseHead0, pulseHead
-                        'mov     lastPulse0, lastPulse
-                                                                                                
+' Above line doesn't do anything useful. encoderQuantaX isn't used                                                                                             
                         
                         add     shiftNewScanRight, sourceIncrement
                         add     setOldScanValue, sourceIncrement
@@ -479,7 +527,7 @@ addChangeToQuanta       add     0-0, encoderChange 'encoderQuanta0, encoderChang
                         add     newPulseBecomesLast, destinationIncrement
                         add     writePulseBufferSum, sourceIncrement
 
-                        add     addPulseHead, sourceIncrement 'destAndSourceIncrement
+                        add     addPulseHead, sourceIncrement
                         add     addFourToPulseHead, destinationIncrement
                         add     checkForRollover, destinationIncrement
 
@@ -491,127 +539,22 @@ addChangeToQuanta       add     0-0, encoderChange 'encoderQuanta0, encoderChang
                         add     setPulsePtr, sourceIncrement
                         add     movToOldScan, destinationIncrement
                         add     addChangeToQuanta, destinationIncrement
-
                         
                         djnz    channelCountdown, #originalScanValues
 
-                        'mov     encoderTotal, encoderTotal1     
-                        'mov     encoderAddress, encoderAddress1   
-
-                        'mov     lastPulse, lastPulse1
-                        'mov     pulseBufferSumPtr, pulseBufferSumPtr1  ' no change
-                        'mov     pulseHead, pulseHead1   ' will change
-                        'mov     lastUpdatedPtr, lastUpdatedPtr1    ' no change
-                        'mov     pulseTotal, pulseTotal1   ' will change
-                       {{ mov     newscan, originalScan           
-                        shr     newscan, encoderPin1
-                        mov     oldScan, oldscan1
-
-                        mov     pulsePtr, pulsePtr1       ' no change
-                        'mov     directionFlagPtr, directionFlagPtr1
-                        
-                        call    #chkEncoder               ' run algorithm with active variables
-                        mov     oldscan1, newscan 
-                        'mov     encoderTotal1, encoderTotal
-                        add     encoderQuanta1, encoderChange
-
-                        'mov     pulseTotal1, pulseTotal
-                        'mov     pulseHead1, pulseHead
-                        'mov     lastPulse1, lastPulse
-
-                        '' >>4to2<< comment out below
-                        mov     newscan, originalScan           
-                        shr     newscan, encoderPin2
-                        mov     oldScan, oldscan2               
-                        'mov     encoderTotal, encoderTotal2     
-                        'mov     encoderAddress, encoderAddress2   
-                        add     addChange, destinationIncrement
-                        add     writeTotal, destAndSourceIncrement
-                        add     subtractLastPulse, sourceIncrement
-                        add     newPulseBecomesLast, destinationIncrement
-                        add     writePulseBufferSum, sourceIncrement
-                        
-                        add     addPulseHead, sourceIncrement 'destAndSourceIncrement
-                        add     addFourToPulseHead, destinationIncrement
-                        add     checkForRollover, destinationIncrement
-
-                        add     writeLastUpdateTime, sourceIncrement
-                        add     subtractOldPulse, destinationIncrement
-                        add     addNewtime, destinationIncrement
-                        add     movPulseTotalTempTotal, sourceIncrement
-                        add     writeToDirectionFlagPtr, sourceIncrement
-                        
-                        'mov     lastPulse, lastPulse2
-                        'mov     pulseBufferSumPtr, pulseBufferSumPtr2  ' no change
-                        'mov     pulseHead, pulseHead2   ' will change
-                        'mov     lastUpdatedPtr, lastUpdatedPtr2    ' no change
-                        'mov     pulseTotal, pulseTotal2   ' will change
-                        mov     pulsePtr, pulsePtr2       ' no change
-                        'mov     directionFlagPtr, directionFlagPtr2
-                        
-                        call    #chkEncoder                     ' run algorithm with active variables
-                        mov     oldscan2, newscan 
-                        'mov     encoderTotal2, encoderTotal
-                        add     encoderQuanta2, encoderChange
-
-                        'mov     pulseTotal2, pulseTotal
-                        'mov     pulseHead2, pulseHead
-                        'mov     lastPulse2, lastPulse
-                        
-                        mov     newscan, originalScan           
-                        shr     newscan, encoderPin3
-                        mov     oldScan, oldscan3               
-                        'mov     encoderTotal, encoderTotal3     
-                        'mov     encoderAddress, encoderAddress3   
-                        add     addChange, destinationIncrement
-                        add     writeTotal, destAndSourceIncrement
-                        add     subtractLastPulse, sourceIncrement
-                        add     newPulseBecomesLast, destinationIncrement
-                        add     writePulseBufferSum, sourceIncrement
-                        
-                        add     addPulseHead, sourceIncrement 'destAndSourceIncrement
-                        add     addFourToPulseHead, destinationIncrement
-                        add     checkForRollover, destinationIncrement
-
-                        add     writeLastUpdateTime, sourceIncrement
-                        add     subtractOldPulse, destinationIncrement
-                        add     addNewtime, destinationIncrement
-                        add     movPulseTotalTempTotal, sourceIncrement
-                        add     writeToDirectionFlagPtr, sourceIncrement
-                        
-                        'mov     lastPulse, lastPulse3
-                        'mov     pulseBufferSumPtr, pulseBufferSumPtr3  ' no change
-                        'mov     pulseHead, pulseHead3   ' will change
-                        'mov     lastUpdatedPtr, lastUpdatedPtr3    ' no change
-                        'mov     pulseTotal, pulseTotal3   ' will change
-                        mov     pulsePtr, pulsePtr3       ' no change
-                        'mov     directionFlagPtr, directionFlagPtr3
-                        
-                        call    #chkEncoder                     ' run algorithm with active variables
-                        mov     oldscan3, newscan 
-                        'mov     encoderTotal3, encoderTotal
-                        add     encoderQuanta3, encoderChange  }}
-
-                        'mov     pulseTotal3, pulseTotal
-                        'mov     pulseHead3, pulseHead
-                        'mov     lastPulse3, lastPulse
-                        '' >>4to2<< comment out above
-                        
-                        jmp     #encloop
+                        jmp     #mainLoop
 
 '-------------------------------------------------------------------------------
                         
-DAT chkencoder          mov     encoderChange, zero
-                        and     newscan, #%11                   ' about 30 instructions
+DAT checkEncoder        mov     encoderChange, zero
+                        and     newscan, #%11                  
                         cmp     newscan, oldScan        wz      ' check for change
               if_z      jmp     #updateAlternatingBuffer                        
-              'if_z      jmp     #chkencoder_ret 'encloop 'chkencoder ' ' wait if none
-
+              
                         'there is a change
                         
-addPulseHead            add     pulsePtr, 0-0
-'addPulseHead            add     0-0, 0-0 'pulsePtr, pulseHead
-'                        add     pulsePtr, pulseHead
+addPulseHead            add     pulsePtr, 0-0 'pulseHead
+
                         mov     newPulse, cnt
                         rdlong  oldPulse, pulsePtr
 subtractOldPulse        sub     0-0, oldPulse
@@ -619,7 +562,8 @@ subtractOldPulse        sub     0-0, oldPulse
 writeLastUpdateTime     wrlong  newPulse, 0-0 'lastUpdatedPtr
 '                        wrlong  newPulse, lastUpdatedPtr
                         'sub     lastPulse, newPulse  ' lastPulse is differnence between loop's cnt values
-                        mov     temp, newPulse ' store this loop's cnt value in lastPulse
+                        mov     temp, newPulse
+                        ' store this loop's cnt value in lastPulse **?
 
 subtractLastPulse       sub     temp, 0-0 'lastPulse
 newPulseBecomesLast     mov     0-0, newPulse
@@ -627,63 +571,62 @@ newPulseBecomesLast     mov     0-0, newPulse
 '                        mov     lastPulse, newPulse
                         'shr     temp, #4
 addNewtime              add     0-0, temp 'pulseTotal, temp
-'                        add     pulseTotal, temp
                         
-                        'wrlong  pulseTotal, pulseBufferSumPtr   ' yes stomping
+                        'wrlong  pulseTotal, pulseBufferSumPtr  
 movPulseTotalTempTotal  mov     tempTotal, 0-0 'pulseTotal
-'                        mov     tempTotal, pulseTotal
+' I'm not sure why I didn't directly mov the pulseTotal value to tempTotal
+' with a movs command. Is this part of the process of monitoring
+' full cycles?
                         shr     tempTotal, bufferBitsToShift
-                        'wrlong  tempTotal, pulseBufferSumPtr   ' yes stomping
-writePulseBufferSum     wrlong  tempTotal, 0-0 'pulseBufferSumPtr                ' yes stomping                         
+
+writePulseBufferSum     wrlong  tempTotal, 0-0 'pulseBufferSumPtr                                       
                                      
 addFourToPulseHead      add     0-0, #4 'pulseHead, #4
 checkForRollover        cmpsub  0-0, headRollover 'pulseHead, headRollover               
-'                        add     pulseHead, #4
-'                        cmpsub  pulseHead, headRollover                
-                        
-                        wrlong  temp, pulsePtr                  ' not stomping
+'                                                
+                        wrlong  temp, pulsePtr              
                         
                         
-case11                  cmp     oldscan, #%11           wz      ' oldscan == %11?         
-              if_nz     jmp     #case01                         '20 if no, try next         
-                        cmp     newscan, #%01           wz      ' clockwise (postive)? Z = yes 
-                        jmp     #update
+case11                  cmp     oldscan, #%11 wz        ' oldscan == %11?         
+              if_nz     jmp     #case01                 ' if no, try next         
+                        cmp     newscan, #%01 wz        ' clockwise (postive)? Z = yes 
+                        jmp     #update                 ' use Z flag to indicate direction
 
-case01                  cmp     oldscan, #%01           wz
+case01                  cmp     oldscan, #%01 wz
               if_nz     jmp     #case00
-                        cmp     newscan, #%00           wz   '40
+                        cmp     newscan, #%00 wz   
               if_z      mov     newCycleFlag, one
                         jmp     #update                        
 
-case00                  cmp     oldscan, #%00           wz      
+case00                  cmp     oldscan, #%00 wz      
               if_nz     jmp     #case10                         
-                        cmp     newscan, #%10           wz      
-                        jmp     #update                      '60
+                        cmp     newscan, #%10 wz      
+                        jmp     #update                      
                                                                           
-case10                  cmp     oldscan, #%10           wz
-              if_nz     jmp     #chkencoder_ret                 ' (should never happen)
-                        cmp     newscan, #%11           wz
+case10                  cmp     oldscan, #%10 wz
+              if_nz     jmp     #checkEncoder_ret       ' this should never happen
+                                                        ' add error flag?
+                        cmp     newscan, #%11 wz
               if_nz     mov     newCycleFlag, one
               
-update        if_z      mov     encoderChange, negOne             ' increment value
+update        if_z      mov     encoderChange, negOne   ' decrement value
 
-decvalue      if_nz     mov     encoderChange, one              ' decrement
-'                        wrlong  encoderChange, directionFlagPtr
-writeToDirectionFlagPtr wrlong  encoderChange, 0-0 'directionFlagPtr
-                        'add     encoderTotal, encoderChange                        
-addChange               add     0-0, encoderChange 'encoderTotal, encoderChange                        
+decvalue      if_nz     mov     encoderChange, one      ' increment
+
+writeToDirectionFlagPtr wrlong  encoderChange, 0-0 ' directionFlagPtr; I'm not sure if this is needed.
+                                         
+addChange               add     0-0, encoderChange ' add encoderChange to encoderTotal                       
 
                         tjz     newCycleFlag, #writeTotal
 recordTimeOfCycle       mov     0-0, loopTimer
-fullCycleCount          mov     0-0, 0-0 'encoderTotal
+fullCycleCount          mov     0-0, 0-0 ' encoderTotal
                         
-writeTotal              wrlong  0-0, 0-0 'encoderTotal, encoderAddress 88 to 92update hub  ' keep this
-'writeTotal              wrlong  encoderTotal, encoderAddress' 88 to 92update hub  ' keep this
+writeTotal              wrlong  0-0, 0-0 ' encoderTotal to full cycle address
+
 recordTimeOfTransition  mov     0-0, loopTimer
 updateAlternatingBuffer add     recordTimeOfTransition, destinationIncrement
 
-writeEncoderTotal       wrlong  0-0, encoderAddressTemp 'encoderTotal, encoderAddressTemp
-'                        wrlong  encoderTotal, encoderAddressTemp     
+writeEncoderTotal       wrlong  0-0, encoderAddressTemp     
                         add     recordTimeOfCycle, destinationIncrement
                         add     encoderAddressTemp, #4
 
@@ -701,10 +644,10 @@ updateFullCycleTime     wrlong  0-0, encoderAddressTemp
                                                                    
                         add     fullCycleCount, destAndSourceIncrement
                         add     writeEncoderTotal, destinationIncrement                                               
-chkencoder_ret          ret
+checkEncoder_ret        ret
 
 '-------------------------------------------------------------------------------
-DAT checkPwm            rdlong  pwmTimeCog, pwmTimePtr   ' 50ns * ((4 * 4) + 5)
+DAT checkPwm            rdlong  pwmTimeCog, pwmTimePtr   ' 50ns * ?
                         add     pwmTimer, pwmTimeCog
                         
                         movd    readOnTime, #onTimeCog0
@@ -722,21 +665,7 @@ afterTurnOn             add     readOnTime, destAndSourceIncrement
                         add     turnOnEnableMask, sourceIncrement
 
                         djnz    channelCountdown, #readOnTime
-                        
-{checkPwm1               rdlong  onTimeCog1, onTimePtr1
-                        tjz     onTimeCog1, #checkPwm2     '' >>4to2<< comment out line
-                        'tjz     onTimeCog1, #continueLoop '' >>4to2<< uncomment line
-                        or      outa, enableMask1
-
-                        '' >>4to2<< comment out below
-checkPwm2               rdlong  onTimeCog2, onTimePtr2 
-                        tjz     onTimeCog2, #checkPwm3
-                        or      outa, enableMask2
-checkPwm3               rdlong  onTimeCog3, onTimePtr3   
-                        tjz     onTimeCog3, #continueLoop 
-                        or      outa, enableMask3       }
-                        '' >>4to2<< comment out above
-                                               
+                
                         jmp     #continueLoop                        
 '-------------------------------------------------------------------------------
 

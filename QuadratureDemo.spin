@@ -835,7 +835,7 @@ PUB ControlLoop | channelIndex
 
     ComputeOutputs(firstActiveChannel, lastActiveChannel)
 
-    result := Encoders.RefreshSpeed ' The value of "output" will be used by the
+    result := Encoders.RefreshPower ' The value of "output" will be used by the
     ' child object to set the power to the motors.
 
     controlLoopCounter++
