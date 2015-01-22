@@ -370,8 +370,11 @@ PUB RefreshPower | localPower, localIndex
 PRI SetServoPwm(localIndex)
 
   result := negPwmResolution #> long[targetPowerPtr][localIndex] <#= pwmResolution
-  pwmOnTime[localIndex] := servoStopTics + ((servoFullSpeedTics * result) / pwmResolution) 
-  
+  if forwardPositivePin
+    pwmOnTime[localIndex] := servoStopTics + ((servoFullSpeedTics * result) / pwmResolution) 
+  else
+    pwmOnTime[localIndex] := servoStopTics - ((servoFullSpeedTics * result) / pwmResolution)
+    
 PUB GetBufferSize
 
   result := bufferSize
@@ -611,7 +614,7 @@ case10                  cmp     oldscan, #%10 wz
               
 update        if_z      mov     encoderChange, negOne   ' decrement value
 
-decvalue      if_nz     mov     encoderChange, one      ' increment
+incrementEnc  if_nz     mov     encoderChange, one      ' increment
 
 writeToDirectionFlagPtr wrlong  encoderChange, 0-0 ' directionFlagPtr; I'm not sure if this is needed.
                                          
